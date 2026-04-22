@@ -237,4 +237,37 @@ impl Wallet {
         let _res: Vec<Value> = self.rpc.call("importdescriptors", &[import_requests])?;
         Ok(())
     }
+
+    /// Verify the SPV proof for a transaction.
+    pub fn verify_tx_out_proof(
+        &self,
+        expected_txid: &bitcoin::Txid,
+        proof_hex: &str,
+    ) -> Result<(), WalletError> {
+        if proof_hex.is_empty() {
+            return Err(WalletError::General(
+                "Missing funding tx merkle proof".to_string(),
+            ));
+        }
+
+        let proof_txids: Vec<bitcoin::Txid> = self
+            .rpc
+            .call("verifytxoutproof", &[json!(proof_hex)])
+            .map_err(WalletError::Rpc)?;
+
+        if proof_txids.is_empty() {
+            return Err(WalletError::General(
+                "proof failed SPV verification or not in best chain".to_string(),
+            ));
+        }
+
+        if proof_txids.len() != 1 || proof_txids.first() != Some(expected_txid) {
+            return Err(WalletError::General(format!(
+                "Funding tx merkle proof does not match expected txid. Expected: {}, Got: {:?}",
+                expected_txid, proof_txids
+            )));
+        }
+
+        Ok(())
+    }
 }

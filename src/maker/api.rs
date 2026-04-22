@@ -747,6 +747,61 @@ impl MakerServer {
         swaps.remove(swap_id);
     }
 
+    /// Wait for and verify an SPV proof.
+    ///
+    /// This method polls the node to verify a funding transaction SPV proof, implementing
+    /// a backoff strategy so that short delays in block relay do not cause immediate failure.
+    pub fn wait_and_verify_tx_out_proof(
+        &self,
+        txid: &bitcoin::Txid,
+        proof_hex: &str,
+    ) -> Result<(), MakerError> {
+        let mut attempts = 0;
+        let max_attempts = 12;
+        loop {
+            let res = {
+                let wallet_read = self
+                    .wallet
+                    .read()
+                    .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+                wallet_read.verify_tx_out_proof(txid, proof_hex)
+            };
+
+            match res {
+                Ok(_) => break Ok(()),
+                Err(e) => {
+                    let should_retry = match &e {
+                        crate::wallet::WalletError::General(msg) if msg.contains("SPV") => true,
+                        crate::wallet::WalletError::Rpc(rpc_err) => {
+                            let err_str = rpc_err.to_string().to_lowercase();
+                            let is_malformed = err_str.contains("malformed proof")
+                                || err_str.contains("invalid proof")
+                                || err_str.contains("decode");
+                            !is_malformed
+                        }
+                        _ => false,
+                    };
+
+                    if !should_retry {
+                        return Err(e.into());
+                    }
+
+                    attempts += 1;
+                    if attempts >= max_attempts {
+                        return Err(e.into());
+                    }
+                    log::info!(
+                        "SPV proof verification failed, retrying in 5s (attempt {}/{}): {:?}",
+                        attempts,
+                        max_attempts,
+                        e
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                }
+            }
+        }
+    }
+
     /// Check if any swaps are currently in progress.
     pub fn has_ongoing_swaps(&self) -> bool {
         !self.ongoing_swaps.lock().unwrap().is_empty()
@@ -1202,6 +1257,11 @@ impl MakerTrait for MakerServer {
                 .ok_or(MakerError::General("Funding output not found"))?
                 as u32;
 
+            let funding_txid = funding_info.funding_tx.compute_txid();
+
+            // Verify the taker-provided SPV proof commits to this funding transaction.
+            self.wait_and_verify_tx_out_proof(&funding_txid, &funding_info.funding_tx_merkleproof)?;
+
             // Check the funding_tx is confirmed to required depth
             let wallet_read = self
                 .wallet
@@ -1210,11 +1270,7 @@ impl MakerTrait for MakerServer {
 
             if let Some(txout) = wallet_read
                 .rpc
-                .get_tx_out(
-                    &funding_info.funding_tx.compute_txid(),
-                    funding_output_index,
-                    None,
-                )
+                .get_tx_out(&funding_txid, funding_output_index, None)
                 .map_err(WalletError::Rpc)?
             {
                 if txout.confirmations < REQUIRED_CONFIRMS {
@@ -1247,7 +1303,7 @@ impl MakerTrait for MakerServer {
 
             if !wallet_read.does_prevout_match_cached_contract(
                 &OutPoint {
-                    txid: funding_info.funding_tx.compute_txid(),
+                    txid: funding_txid,
                     vout: funding_output_index,
                 },
                 &contract_spk,
